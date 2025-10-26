@@ -111,7 +111,7 @@ async def main():
                     "content": md,
                     "title": parsed.get("task", "학습 요약"),
                     "date": parsed.get("due"),
-                    "tags": ["Summary", "과제"]
+                    "tags": ["과제"]
                 }
             }
         }
