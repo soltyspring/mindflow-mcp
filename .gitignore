@@ -14,7 +14,9 @@ mcp.txt
 mcpservergpt.py
 *.log
 *.tmp
-
+im.py
+test222.py
+package-lock.json
 # Python 캐시 및 빌드 파일
 __pycache__/
 *.pyc
@@ -29,6 +31,10 @@ Thumbs.db
 .idea/
 *.iml
 
+#폴더
+web/
+output/
+참고/
 # ------------------------------
 # ✅ 허용 (명시적으로 포함)
 # ------------------------------
