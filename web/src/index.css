@@ -1,0 +1,5 @@
+﻿@import "tailwindcss";
+@reference "tailwindcss";   /* ← 추가 */
+
+html, body, #root { height: 100%; }
+body { @apply bg-gray-50 text-gray-900; }
