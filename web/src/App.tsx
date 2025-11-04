@@ -213,7 +213,7 @@ export default function App() {
                 className="px-4 py-2 rounded-xl border hover:bg-gray-100"
                 title="회원가입/로그인"
               >
-                Google로(로그인/회원가입)
+                Login
               </button>
               <button
                 onClick={() => (canSubmit ? setConfirmOpen(true) : toast.show("텍스트 또는 파일을 넣어주세요"))}

@@ -9,17 +9,40 @@ from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-from sqlalchemy import create_engine, Column, BigInteger, String, Text, DateTime, func
-from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from sqlalchemy import create_engine, Column, BigInteger, String, Text, DateTime, ForeignKey, func
+from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
+from sqlalchemy import or_
 
 from cryptography.fernet import Fernet
+
+
+# DB 엔진 및 세션 설정
+# ─────────────────────────────────────────────────────────────
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
+
+DATABASE_URL = os.getenv("DATABASE_URL", "mysql+pymysql://root:a3497@localhost:3306/mindflow")
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+# FastAPI 종속성 주입용
+def get_db():
+    """
+    요청마다 새로운 DB 세션을 생성하고, 요청이 끝나면 자동으로 닫아주는 함수
+    """
+    db: Session = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 0) .env 먼저 로드 (기존 코드보다 위로 당김: 환경변수 선반영)
 # ──────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 # ──────────────────────────────────────────────────────────────────────────────
-# 1) 환경변수
+# 1) 환경변수GoogleUser
 # ──────────────────────────────────────────────────────────────────────────────
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173/")
 PRESENTON_URL = os.getenv("PRESENTON_URL", "http://localhost:5000")
@@ -42,25 +65,31 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
-def get_db():
-    db: Session = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-class User(Base):
-    __tablename__ = "users"
+# ─────────── GoogleUser ───────────
+class GoogleUser(Base):
+    __tablename__ = "google_users"
     id = Column(BigInteger, primary_key=True, autoincrement=True)
-    google_sub = Column(String(64), nullable=False, unique=True)
-    email = Column(String(255), nullable=False, unique=True)
+    google_id = Column(String(255), unique=True, nullable=False)
+    email = Column(String(255), unique=True, nullable=False)
     name = Column(String(120))
     picture = Column(String(512))
-    notion_token_enc = Column(Text)  # 암호화 저장
-    created_at = Column(DateTime, nullable=False, server_default=func.now())
-    updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
-Base.metadata.create_all(engine)
+    notion_token = relationship("NotionToken", back_populates="user", uselist=False)
+
+# ─────────── NotionToken ───────────
+class NotionToken(Base):
+    __tablename__ = "notion_tokens"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    google_user_id = Column(BigInteger, ForeignKey("google_users.id"), nullable=False)
+    notion_token = Column(Text, nullable=False)  # 암호화 저장
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("GoogleUser", back_populates="notion_token")
+
+
 
 def enc(s: str) -> str:
     return fernet.encrypt(s.encode()).decode()
@@ -78,14 +107,17 @@ app = FastAPI(title="MindFlow Web API", version="0.1.0")
 
 # CORS 설정
 from fastapi.middleware.cors import CORSMiddleware
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173/")
+FRONTEND_ORIGIN = "http://localhost:5173"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # 프론트 실행 주소
+    allow_origins=[FRONTEND_ORIGIN],   # ← 딱 하나만, localhost 기준
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # 서버 사이드 세션(서명 쿠키) — DB 불필요
 from starlette.middleware.sessions import SessionMiddleware
 app.add_middleware(
@@ -281,25 +313,20 @@ def auth_callback(request: Request, code: Optional[str] = None, state: Optional[
     picture = claims.get("picture")
 
     # 🔹 DB 업서트
-    user = db.query(User).filter((User.google_sub == sub) | (User.email == email)).one_or_none()
-    if user:
-        user.google_sub = sub
-        user.email = email or user.email
-        user.name = name
-        user.picture = picture
+    u = db.query(GoogleUser).filter(or_(GoogleUser.google_id == sub, GoogleUser.email == email)).one_or_none()
+    if u:
+        u.google_id = sub
+        u.email = email or u.email
+        u.name = name
+        u.picture = picture
     else:
-        user = User(google_sub=sub, email=email, name=name, picture=picture)
-        db.add(user)
+        u = GoogleUser(google_id=sub, email=email, name=name, picture=picture)
+        db.add(u)
     db.commit()
-    db.refresh(user)
+    db.refresh(u)
 
-    # 🔹 세션에 DB id 포함
     request.session["user"] = {
-        "id": user.id,
-        "sub": sub,
-        "email": email,
-        "name": name,
-        "picture": picture,
+        "id": u.id, "sub": sub, "email": email, "name": name, "picture": picture,
     }
 
     return RedirectResponse(FRONTEND_URL)
@@ -310,17 +337,17 @@ def me(request: Request, db: Session = Depends(get_db)):
     sess = get_current_user(request)
     if not sess:
         return _err("unauthenticated", 401)
-    user = db.get(User, sess.get("id")) if sess.get("id") else None
-    return {
-        "ok": True,
-        "user": {
-            "id": user.id if user else None,
-            "email": sess.get("email"),
-            "name": sess.get("name"),
-            "picture": sess.get("picture"),
-            "has_notion": bool(user and user.notion_token_enc),
-        }
-    }
+    u = db.get(GoogleUser, sess.get("id")) if sess.get("id") else None
+    has_notion = bool(u and u.notion_token)
+    return {"ok": True, "user": {
+        "id": u.id if u else None,
+        "email": sess.get("email"),
+        "name": sess.get("name"),
+        "picture": sess.get("picture"),
+        "has_notion": has_notion,
+    }}
+
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -412,10 +439,15 @@ def save_notion_token(payload: NotionTokenIn, request: Request, db: Session = De
     sess = get_current_user(request)
     if not sess:
         return _err("unauthenticated", 401)
-    user = db.get(User, sess["id"])
-    if not user:
+    u = db.get(GoogleUser, sess["id"])
+    if not u:
         return _err("user not found", 404)
-    user.notion_token_enc = enc(payload.token)
+
+    enc_token = enc(payload.token)
+    if u.notion_token:
+        u.notion_token.notion_token = enc_token
+    else:
+        db.add(NotionToken(google_user_id=u.id, notion_token=enc_token))
     db.commit()
     return {"ok": True}
 
@@ -424,10 +456,10 @@ def delete_notion_token(request: Request, db: Session = Depends(get_db)):
     sess = get_current_user(request)
     if not sess:
         return _err("unauthenticated", 401)
-    user = db.get(User, sess["id"])
-    if not user:
+    u = db.get(GoogleUser, sess["id"])
+    if not u:
         return _err("user not found", 404)
-    user.notion_token_enc = None
-    db.commit()
+    if u.notion_token:
+        db.delete(u.notion_token)
+        db.commit()
     return {"ok": True}
-    return ProcessOut(title=title, task=task, due=due, content_md=md, notion=notion_res, ppt=ppt_res)
