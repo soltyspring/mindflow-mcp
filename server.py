@@ -9,6 +9,11 @@ from fastapi.responses import RedirectResponse, JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
+from sqlalchemy import create_engine, Column, BigInteger, String, Text, DateTime, func
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+
+from cryptography.fernet import Fernet
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 0) .env 먼저 로드 (기존 코드보다 위로 당김: 환경변수 선반영)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -20,12 +25,48 @@ FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173/")
 PRESENTON_URL = os.getenv("PRESENTON_URL", "http://localhost:5000")
 PRESENTON_TIMEOUT = int(os.getenv("PRESENTON_TIMEOUT", "120"))
 PPT_SERVICE_URL = os.getenv("PPT_SERVICE_URL")  # 예: http://localhost:5000/generate
+DATABASE_URL = os.getenv("DATABASE_URL")
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 
 # Google OAuth
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
-SESSION_SECRET = os.getenv("SESSION_SECRET", "change-me")  # 반드시 강한 랜덤값
+SESSION_SECRET = os.getenv("SESSION_SECRET", "change-me")
+
+#DB 세션 암호화 키
+fernet = Fernet(ENCRYPTION_KEY.encode() if isinstance(ENCRYPTION_KEY, str) else ENCRYPTION_KEY)
+
+Base = declarative_base()
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+
+def get_db():
+    db: Session = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    google_sub = Column(String(64), nullable=False, unique=True)
+    email = Column(String(255), nullable=False, unique=True)
+    name = Column(String(120))
+    picture = Column(String(512))
+    notion_token_enc = Column(Text)  # 암호화 저장
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+Base.metadata.create_all(engine)
+
+def enc(s: str) -> str:
+    return fernet.encrypt(s.encode()).decode()
+
+def dec(s: str) -> str:
+    return fernet.decrypt(s.encode()).decode()
 
 # ── MCP 툴이 들어있는 모듈 (compose_dual_tool, notion_tool 사용)
 import mcpserver  # 같은 디렉터리에 있어야 import 성공
@@ -179,12 +220,23 @@ def auth_login(request: Request):
     url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
     return RedirectResponse(url)
 
+@app.post("/logout")
+def logout(request: Request):
+    # 세션 내용 비우기
+    request.session.clear()
+
+    # 응답 생성 + 세션 쿠키 강제 삭제(이름 기본값: "session")
+    resp = JSONResponse({"ok": True})
+    # SessionMiddleware 기본 쿠키 이름은 "session" 입니다. 바꾸지 않았다면 아래 그대로 사용.
+    resp.delete_cookie(key="session", path="/")
+    return resp
+
 @app.get("/auth/google/callback")
-def auth_callback(request: Request, code: Optional[str] = None, state: Optional[str] = None):
+def auth_callback(request: Request, code: Optional[str] = None, state: Optional[str] = None, db: Session = Depends(get_db)):
     if not code or not state:
         return _err("missing code/state")
 
-    # state 검증 (10분 유효)
+    # state 검증
     try:
         raw = _signer.unsign(state.encode(), max_age=600)
         _ = json.loads(raw.decode())
@@ -217,33 +269,59 @@ def auth_callback(request: Request, code: Optional[str] = None, state: Optional[
     if not id_tok:
         return _err("no id_token", 502)
 
-    # ID 토큰 검증 (iss, aud, exp)
+    # ID 토큰 검증
     try:
         claims = id_token.verify_oauth2_token(id_tok, google_requests.Request(), GOOGLE_CLIENT_ID)
-        # claims 예) { "sub": "...", "email": "...", "name": "...", "picture": "..." }
     except Exception as e:
         return _err(f"id_token invalid: {e}", 401)
 
-    # 세션 저장 (DB 불필요)
+    sub = claims.get("sub")
+    email = claims.get("email")
+    name = claims.get("name")
+    picture = claims.get("picture")
+
+    # 🔹 DB 업서트
+    user = db.query(User).filter((User.google_sub == sub) | (User.email == email)).one_or_none()
+    if user:
+        user.google_sub = sub
+        user.email = email or user.email
+        user.name = name
+        user.picture = picture
+    else:
+        user = User(google_sub=sub, email=email, name=name, picture=picture)
+        db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    # 🔹 세션에 DB id 포함
     request.session["user"] = {
-        "sub": claims.get("sub"),
-        "email": claims.get("email"),
-        "name": claims.get("name"),
-        "picture": claims.get("picture"),
+        "id": user.id,
+        "sub": sub,
+        "email": email,
+        "name": name,
+        "picture": picture,
     }
-    return RedirectResponse(FRONTEND_URL)  # 필요시 원하는 경로로 변경
+
+    return RedirectResponse(FRONTEND_URL)
+
 
 @app.get("/me")
-def me(request: Request):
-    user = get_current_user(request)
-    if not user:
+def me(request: Request, db: Session = Depends(get_db)):
+    sess = get_current_user(request)
+    if not sess:
         return _err("unauthenticated", 401)
-    return {"ok": True, "user": user}
+    user = db.get(User, sess.get("id")) if sess.get("id") else None
+    return {
+        "ok": True,
+        "user": {
+            "id": user.id if user else None,
+            "email": sess.get("email"),
+            "name": sess.get("name"),
+            "picture": sess.get("picture"),
+            "has_notion": bool(user and user.notion_token_enc),
+        }
+    }
 
-@app.post("/logout")
-def logout(request: Request):
-    request.session.clear()
-    return {"ok": True}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 6) 기존 엔드포인트
@@ -324,5 +402,32 @@ async def process_file(
         content=md, title=title, date=due, tags=tags_final if tags_final else None
     )
     ppt_res = _make_ppt_with_presenton(title, md) if make_ppt else None
+    return ProcessOut(title=title, task=task, due=due, content_md=md, notion=notion_res, ppt=ppt_res)
 
+class NotionTokenIn(BaseModel):
+    token: str
+
+@app.post("/me/notion-token")
+def save_notion_token(payload: NotionTokenIn, request: Request, db: Session = Depends(get_db)):
+    sess = get_current_user(request)
+    if not sess:
+        return _err("unauthenticated", 401)
+    user = db.get(User, sess["id"])
+    if not user:
+        return _err("user not found", 404)
+    user.notion_token_enc = enc(payload.token)
+    db.commit()
+    return {"ok": True}
+
+@app.delete("/me/notion-token")
+def delete_notion_token(request: Request, db: Session = Depends(get_db)):
+    sess = get_current_user(request)
+    if not sess:
+        return _err("unauthenticated", 401)
+    user = db.get(User, sess["id"])
+    if not user:
+        return _err("user not found", 404)
+    user.notion_token_enc = None
+    db.commit()
+    return {"ok": True}
     return ProcessOut(title=title, task=task, due=due, content_md=md, notion=notion_res, ppt=ppt_res)
