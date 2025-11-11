@@ -54,7 +54,7 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
 SESSION_SECRET = os.getenv("SESSION_SECRET", "change-me")
-
+FAST_SAVE = os.getenv("FAST_SAVE", "1") == "1"  # compose_and_save_tool 사용 토글
 #DB 세션 암호화 키
 fernet = Fernet(ENCRYPTION_KEY.encode() if isinstance(ENCRYPTION_KEY, str) else ENCRYPTION_KEY)
 
@@ -459,99 +459,138 @@ def health():
     }
 
 @app.post("/process", response_model=ProcessOut)
-async def process_json(payload: ProcessIn, user=Depends(require_user), db: Session = Depends(get_db)): # ← 로그인 필요하게 예시 적용
-    comp = await asyncio.to_thread(mcpserver.compose_dual_tool, payload.text)
-
-    title = _clamp10(comp.get("title") or comp.get("task") or "학습요약")
-    task  = comp.get("task") or title
-
-    comp_due = comp.get("due")
-    due      = payload.date or comp_due
-
-    base_tags = (payload.tags or []).copy()
-    if comp_due:
-        base_tags.append("과제")
-    tags = []
-    for t in base_tags:
-        t = (t or "").strip()
-        if t and t not in tags:
-            tags.append(t)
-
-    md = comp.get("content_md") or "# 요약\n(내용이 비어 있습니다)"
-
-    # ✅ 노션 DB 보장 (없으면 자동 생성)
+async def process_json(payload: ProcessIn, user=Depends(require_user), db: Session = Depends(get_db)):
+    # 공통 준비: 사용자 노션 토큰/DB 보장
     token = _get_user_notion_token(db, user["id"])
-    db_id = _ensure_user_database(db, user["id"], token)  # ← 반환값 받기!!
+    db_id = _ensure_user_database(db, user["id"], token)
 
-    # ✅ 노션 기록
-    notion_res = await asyncio.to_thread(
-        mcpserver.notion_tool,
-        content=md,
-        title=title,
-            date=due,
-            tags=tags,
+    if FAST_SAVE:
+        # 파싱 직후 페이지 생성 → 요약 완료되면 append (병렬)
+        res = await asyncio.to_thread(
+            mcpserver.compose_and_save_tool,
+            payload.text,
             user_email=user["email"],
-            notion_database_id=db_id,
-            user_token_plain=token,      # ✅ 이 줄 추가!
-            
+            notion_database_id=db_id,   # ← 여기서 명시적으로 DB ID 전달
+            tags=(payload.tags or None),
+            date=payload.date,          # 사용자가 지정하면 우선
+            user_token_plain=token,     # 서버에서 평문 토큰 직접 전달
+        )
+        title = _clamp10(res.get("title") or res.get("task") or "학습요약")
+        task  = res.get("task") or title
+        due   = res.get("due")
+        md    = res.get("content_md") or "# 요약\n(내용이 비어 있습니다)"
+        notion_res = {
+            "status": res.get("status"),
+            "url":    res.get("url"),
+            "page_id":res.get("page_id"),
+        }
+    else:
+        # 기존: compose_dual_tool → notion_tool (직렬)
+        comp = await asyncio.to_thread(mcpserver.compose_dual_tool, payload.text)
+
+        title = _clamp10(comp.get("title") or comp.get("task") or "학습요약")
+        task  = comp.get("task") or title
+        comp_due = comp.get("due")
+        due      = payload.date or comp_due
+
+        # 태그 정제
+        base_tags = (payload.tags or []).copy()
+        if comp_due:
+            base_tags.append("과제")
+        tags = []
+        for t in base_tags:
+            t = (t or "").strip()
+            if t and t not in tags:
+                tags.append(t)
+
+        md = comp.get("content_md") or "# 요약\n(내용이 비어 있습니다)"
+
+        notion_res = await asyncio.to_thread(
+            mcpserver.notion_tool,
+            content=md,
+            title=title,
+            date=due,
+            tags=(tags or None),
+            user_email=user["email"],
+            notion_database_id=db_id,   # ← DB ID 명시 전달
+            user_token_plain=token,
         )
 
-
-    
-
     ppt_res = _make_ppt_with_presenton(title, md) if payload.make_ppt else None
-
     return ProcessOut(title=title, task=task, due=due, content_md=md, notion=notion_res, ppt=ppt_res)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# /process-file (파일 업로드 폼)
+# ──────────────────────────────────────────────────────────────────────────────
 @app.post("/process-file", response_model=ProcessOut)
 async def process_file(
     file: UploadFile = File(...),
     make_ppt: bool = Form(False),
     tags: Optional[str] = Form(None),
     date: Optional[str] = Form(None),
-    user=Depends(require_user),  # ← 로그인 필요
+    user=Depends(require_user),
     db: Session = Depends(get_db),
 ):
-
     text = (file.file.read()).decode("utf-8", errors="ignore")
     user_tags = [t.strip() for t in (tags or "").split(",") if t and t.strip()]
 
-    comp = await asyncio.to_thread(mcpserver.compose_dual_tool, text)
-
-    title = _clamp10(comp.get("title") or comp.get("task") or "학습요약")
-    task  = comp.get("task") or title
-
-    comp_due = comp.get("due")
-    due      = date or comp_due
-
-    base_tags = user_tags.copy()
-    if comp_due:
-        base_tags.append("과제")
-    tags_final = []
-    for t in base_tags:
-        t = (t or "").strip()
-        if t and t not in tags_final:
-            tags_final.append(t)
-
-    md = comp.get("content_md") or "# 요약\n(내용이 비어 있습니다)"
-
-    # ✅ 노션 DB 보장 (없으면 자동 생성)
+    # 공통 준비: 사용자 노션 토큰/DB 보장
     token = _get_user_notion_token(db, user["id"])
     db_id = _ensure_user_database(db, user["id"], token)
 
-    # ✅ 노션 기록
-    notion_res = await asyncio.to_thread(
-        mcpserver.notion_tool,
-        content=md,
-        title=title,
-        date=due,
-        tags=tags_final if tags_final else None,
-        user_email=user["email"],
-        notion_database_id=db_id,  # ← 추가
-    )
+    if FAST_SAVE:
+        res = await asyncio.to_thread(
+            mcpserver.compose_and_save_tool,
+            text,
+            user_email=user["email"],
+            notion_database_id=db_id,      # ← DB ID 명시 전달
+            tags=(user_tags or None),
+            date=date,                     # 업로드 폼의 date 우선
+            user_token_plain=token,
+        )
+        title = _clamp10(res.get("title") or res.get("task") or "학습요약")
+        task  = res.get("task") or title
+        due   = res.get("due")
+        md    = res.get("content_md") or "# 요약\n(내용이 비어 있습니다)"
+        notion_res = {
+            "status": res.get("status"),
+            "url":    res.get("url"),
+            "page_id":res.get("page_id"),
+        }
+    else:
+        comp = await asyncio.to_thread(mcpserver.compose_dual_tool, text)
+
+        title = _clamp10(comp.get("title") or comp.get("task") or "학습요약")
+        task  = comp.get("task") or title
+        comp_due = comp.get("due")
+        due      = date or comp_due
+
+        base_tags = user_tags.copy()
+        if comp_due:
+            base_tags.append("과제")
+        tags_final = []
+        for t in base_tags:
+            t = (t or "").strip()
+            if t and t not in tags_final:
+                tags_final.append(t)
+
+        md = comp.get("content_md") or "# 요약\n(내용이 비어 있습니다)"
+
+        notion_res = await asyncio.to_thread(
+            mcpserver.notion_tool,
+            content=md,
+            title=title,
+            date=due,
+            tags=(tags_final or None),
+            user_email=user["email"],
+            notion_database_id=db_id,      # ← DB ID 명시 전달
+            user_token_plain=token,
+        )
 
     ppt_res = _make_ppt_with_presenton(title, md) if make_ppt else None
     return ProcessOut(title=title, task=task, due=due, content_md=md, notion=notion_res, ppt=ppt_res)
+
 
 class NotionTokenIn(BaseModel):
     token: str
