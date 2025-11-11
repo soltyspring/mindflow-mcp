@@ -23,8 +23,6 @@ from sqlalchemy.orm import sessionmaker, Session
 
 DATABASE_URL = os.getenv("DATABASE_URL", "mysql+pymysql://root:a3497@localhost:3306/mindflow")
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 # FastAPI 종속성 주입용
 def get_db():
@@ -65,6 +63,8 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
+
+
 # ─────────── GoogleUser ───────────
 class GoogleUser(Base):
     __tablename__ = "google_users"
@@ -77,6 +77,16 @@ class GoogleUser(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
     notion_token = relationship("NotionToken", back_populates="user", uselist=False)
+
+# ─────────── NotionSetting ───────────
+class NotionSetting(Base):
+    __tablename__ = "notion_settings"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    google_user_id = Column(BigInteger, ForeignKey("google_users.id"), unique=True, index=True, nullable=False)
+    parent_page_id = Column(String(64), nullable=True)
+    database_id = Column(String(64), nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
 # ─────────── NotionToken ───────────
 class NotionToken(Base):
@@ -113,18 +123,19 @@ FRONTEND_ORIGIN = "http://localhost:5173"
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN],   # ← 딱 하나만, localhost 기준
+    allow_origins=["http://localhost:5173"],  # ✅ 끝에 슬래시 ❌
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # 서버 사이드 세션(서명 쿠키) — DB 불필요
 from starlette.middleware.sessions import SessionMiddleware
 app.add_middleware(
     SessionMiddleware,
     secret_key=SESSION_SECRET,
     same_site="lax",
-    https_only=False,  # 운영 도메인에서는 True + HTTPS 권장
+    https_only=False,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -143,6 +154,28 @@ class ProcessOut(BaseModel):
     content_md: str
     notion: Dict[str, Any]
     ppt: Optional[Dict[str, Any]] = None
+
+
+# === 추가: 통합 세팅 입력 ===
+class NotionSetupIn(BaseModel):
+    token: Optional[str] = None          # secret_... (옵션)
+    parent_url: Optional[str] = None     # 부모 페이지 URL 또는 ID (옵션)
+    name: str = "MindFlow Notes"
+
+# === 추가: Notion 페이지 ID 추출 ===
+def _extract_page_id(url_or_id: str) -> str:
+    s = (url_or_id or "").strip()
+    if not s:
+        raise HTTPException(status_code=400, detail="parent_url 비어 있음")
+    import re
+    # 36자(대시 포함) → 32자로
+    m = re.search(r"([0-9a-fA-F-]{36})", s)
+    if m:
+        return m.group(1).replace("-", "")
+    # 32자 그대로
+    if re.search(r"[0-9a-fA-F]{32}", s):
+        return re.search(r"[0-9a-fA-F]{32}", s).group(0)
+    raise HTTPException(status_code=400, detail="유효한 Notion 페이지 URL/ID가 아닙니다.")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 4) 헬퍼
@@ -207,6 +240,67 @@ def _try_make_ppt(title: str, md: str) -> Optional[dict]:
         return r.json()
     except Exception as e:
         return {"error": str(e)}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 4.5) Notion helpers (토큰/헤더/홈페이지+DB 보장)
+# ──────────────────────────────────────────────────────────────────────────────
+NOTION_VERSION = "2022-06-28"
+
+def _get_user_notion_token(db: Session, user_id: int) -> str:
+    u = db.get(GoogleUser, user_id)
+    if not u or not u.notion_token:
+        raise HTTPException(status_code=404, detail="Notion 토큰이 저장되어 있지 않습니다.")
+    return dec(u.notion_token.notion_token)
+
+def _notion_headers(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+
+def _ensure_home_page(db: Session, user_id: int, token: str) -> str:
+    """
+    내부 통합(internal integration)은 workspace 루트에 페이지를 새로 못 만듭니다.
+    따라서 '부모 페이지'를 미리 받아두고 거기에만 생성해야 합니다.
+    부모가 없으면 명확한 409 에러를 던집니다.
+    """
+    setting = db.query(NotionSetting).filter_by(google_user_id=user_id).one_or_none()
+    if setting and setting.parent_page_id:
+        return setting.parent_page_id
+
+    # 기존: workspace=True 로 페이지 생성하던 부분 제거
+    raise HTTPException(status_code=409, detail="need_parent_page")
+
+def _ensure_user_database(db: Session, user_id: int, token: str, db_name: str = "MindFlow Notes") -> str:
+    setting = db.query(NotionSetting).filter_by(google_user_id=user_id).one_or_none()
+    if setting and setting.database_id:
+        return setting.database_id
+
+    parent_page_id = _ensure_home_page(db, user_id, token)
+    body = {
+        "parent": {"type": "page_id", "page_id": parent_page_id},
+        "title": [{"type": "text", "text": {"content": db_name}}],
+        "properties": {
+            "Name": {"title": {}},
+            "Tags": {"multi_select": {}},
+            "Date": {"date": {}},
+            "Source": {"rich_text": {}},
+            "Status": {"status": {}},
+        },
+    }
+    r = requests.post("https://api.notion.com/v1/databases", headers=_notion_headers(token), json=body, timeout=15)
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=f"데이터베이스 생성 실패: {r.text}")
+    database_id = r.json()["id"]
+
+    if not setting:
+        setting = NotionSetting(google_user_id=user_id, parent_page_id=parent_page_id, database_id=database_id)
+        db.add(setting)
+    else:
+        setting.database_id = database_id
+    db.commit()
+    return database_id
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 5) 구글 OAuth (웹 서버 코드 플로우 + ID 토큰 검증)
@@ -365,7 +459,7 @@ def health():
     }
 
 @app.post("/process", response_model=ProcessOut)
-async def process_json(payload: ProcessIn, user=Depends(require_user)):  # ← 로그인 필요하게 예시 적용
+async def process_json(payload: ProcessIn, user=Depends(require_user), db: Session = Depends(get_db)): # ← 로그인 필요하게 예시 적용
     comp = await asyncio.to_thread(mcpserver.compose_dual_tool, payload.text)
 
     title = _clamp10(comp.get("title") or comp.get("task") or "학습요약")
@@ -385,10 +479,25 @@ async def process_json(payload: ProcessIn, user=Depends(require_user)):  # ← �
 
     md = comp.get("content_md") or "# 요약\n(내용이 비어 있습니다)"
 
+    # ✅ 노션 DB 보장 (없으면 자동 생성)
+    token = _get_user_notion_token(db, user["id"])
+    db_id = _ensure_user_database(db, user["id"], token)  # ← 반환값 받기!!
+
+    # ✅ 노션 기록
     notion_res = await asyncio.to_thread(
         mcpserver.notion_tool,
-        content=md, title=title, date=due, tags=tags if tags else None
-    )
+        content=md,
+        title=title,
+            date=due,
+            tags=tags,
+            user_email=user["email"],
+            notion_database_id=db_id,
+            user_token_plain=token,      # ✅ 이 줄 추가!
+            
+        )
+
+
+    
 
     ppt_res = _make_ppt_with_presenton(title, md) if payload.make_ppt else None
 
@@ -401,7 +510,9 @@ async def process_file(
     tags: Optional[str] = Form(None),
     date: Optional[str] = Form(None),
     user=Depends(require_user),  # ← 로그인 필요
+    db: Session = Depends(get_db),
 ):
+
     text = (file.file.read()).decode("utf-8", errors="ignore")
     user_tags = [t.strip() for t in (tags or "").split(",") if t and t.strip()]
 
@@ -424,10 +535,21 @@ async def process_file(
 
     md = comp.get("content_md") or "# 요약\n(내용이 비어 있습니다)"
 
+    # ✅ 노션 DB 보장 (없으면 자동 생성)
+    token = _get_user_notion_token(db, user["id"])
+    db_id = _ensure_user_database(db, user["id"], token)
+
+    # ✅ 노션 기록
     notion_res = await asyncio.to_thread(
         mcpserver.notion_tool,
-        content=md, title=title, date=due, tags=tags_final if tags_final else None
+        content=md,
+        title=title,
+        date=due,
+        tags=tags_final if tags_final else None,
+        user_email=user["email"],
+        notion_database_id=db_id,  # ← 추가
     )
+
     ppt_res = _make_ppt_with_presenton(title, md) if make_ppt else None
     return ProcessOut(title=title, task=task, due=due, content_md=md, notion=notion_res, ppt=ppt_res)
 
@@ -463,3 +585,103 @@ def delete_notion_token(request: Request, db: Session = Depends(get_db)):
         db.delete(u.notion_token)
         db.commit()
     return {"ok": True}
+
+# (상태 조회) 저장 여부 + 마스킹
+@app.get("/me/notion-token")
+def get_notion_token_status(request: Request, db: Session = Depends(get_db)):
+    sess = get_current_user(request)
+    if not sess:
+        return _err("unauthenticated", 401)
+    u = db.get(GoogleUser, sess["id"])
+    if not u or not u.notion_token:
+        return {"ok": True, "has_token": False, "masked": None}
+    try:
+        plain = dec(u.notion_token.notion_token)
+        masked = (plain[:6] + "****" + plain[-2:]) if len(plain) > 8 else (plain[:4] + "****")
+    except Exception:
+        masked = "(masked)"
+    return {"ok": True, "has_token": True, "masked": masked}
+
+# (유효성 검사)
+@app.post("/me/notion-token/verify")
+def verify_notion_token(request: Request, db: Session = Depends(get_db)):
+    sess = get_current_user(request)
+    if not sess:
+        return _err("unauthenticated", 401)
+    token = _get_user_notion_token(db, sess["id"])
+    r = requests.get("https://api.notion.com/v1/users/me", headers=_notion_headers(token), timeout=10)
+    return {"ok": r.status_code == 200, "status": r.status_code, "body": r.text if r.status_code != 200 else None}
+
+# (DB 상태)
+@app.get("/me/notion-db")
+def get_notion_db_status(request: Request, db: Session = Depends(get_db)):
+    sess = get_current_user(request)
+    if not sess:
+        return _err("unauthenticated", 401)
+    setting = db.query(NotionSetting).filter_by(google_user_id=sess["id"]).one_or_none()
+    return {
+        "ok": True,
+        "has_database": bool(setting and setting.database_id),
+        "database_id": getattr(setting, "database_id", None),
+        "parent_page_id": getattr(setting, "parent_page_id", None),
+    }
+
+# (원클릭) 홈 페이지 + DB 자동 생성
+class InitDbIn(BaseModel):
+    name: str = "MindFlow Notes"
+
+@app.post("/me/notion-db/auto")
+def init_notion_db_auto(payload: InitDbIn, request: Request, db: Session = Depends(get_db)):
+    sess = get_current_user(request)
+    if not sess:
+        return _err("unauthenticated", 401)
+    token = _get_user_notion_token(db, sess["id"])
+    db_id = _ensure_user_database(db, sess["id"], token, db_name=payload.name.strip() or "MindFlow Notes")
+    setting = db.query(NotionSetting).filter_by(google_user_id=sess["id"]).one()
+    return {"ok": True, "database_id": db_id, "parent_page_id": setting.parent_page_id}
+
+@app.post("/me/notion-setup")
+def notion_setup(payload: NotionSetupIn, request: Request, db: Session = Depends(get_db)):
+    sess = get_current_user(request)
+    if not sess:
+        return _err("unauthenticated", 401)
+
+    # ✅ 둘 다 필수
+    if not (payload.token and payload.token.strip() and payload.parent_url and payload.parent_url.strip()):
+        raise HTTPException(status_code=400, detail="token과 parent_url이 모두 필요합니다.")
+
+    # 1) 토큰 저장
+    u = db.get(GoogleUser, sess["id"])
+    if not u:
+        return _err("user not found", 404)
+    enc_token = enc(payload.token.strip())
+    if u.notion_token:
+        u.notion_token.notion_token = enc_token
+    else:
+        db.add(NotionToken(google_user_id=u.id, notion_token=enc_token))
+    db.commit()
+
+    # 2) 부모 페이지 검증 + 저장
+    token = _get_user_notion_token(db, sess["id"])
+    page_id = _extract_page_id(payload.parent_url)
+    r = requests.get(f"https://api.notion.com/v1/pages/{page_id}", headers=_notion_headers(token), timeout=10)
+    if r.status_code == 404:
+        raise HTTPException(status_code=404, detail="해당 페이지를 찾을 수 없습니다.")
+    if r.status_code == 403:
+        raise HTTPException(status_code=403, detail="통합에 페이지 접근권한이 없습니다. 노션에서 ‘공유 → 통합에 연결’을 해주세요.")
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=f"페이지 확인 실패: {r.text}")
+
+    setting = db.query(NotionSetting).filter_by(google_user_id=sess["id"]).one_or_none()
+    if not setting:
+        setting = NotionSetting(google_user_id=sess["id"], parent_page_id=page_id)
+        db.add(setting)
+    else:
+        setting.parent_page_id = page_id
+    db.commit()
+
+    # 3) DB 자동 생성
+    db_id = _ensure_user_database(db, sess["id"], token, db_name=(payload.name or "MindFlow Notes").strip())
+    setting = db.query(NotionSetting).filter_by(google_user_id=sess["id"]).one()
+    return {"ok": True, "database_id": db_id, "parent_page_id": setting.parent_page_id}
+

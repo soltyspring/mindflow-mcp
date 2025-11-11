@@ -6,8 +6,17 @@ from dotenv import load_dotenv
 import warnings, asyncio
 from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy import text
+
+from typing import List, Dict, Any
 
 warnings.filterwarnings("ignore", category=ResourceWarning)
+
+DATABASE_URL = os.getenv("DATABASE_URL", "mysql+pymysql://root:a3497@localhost:3306/mindflow")
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine)
 
 # 윈도우 비동기 루프
 if hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
@@ -68,7 +77,7 @@ def parse_schedule_tool(text: str) -> dict:
     """
     try:
         response = client.messages.create(
-            model="claude-3-haiku-20240307",
+            model="claude-haiku-4-5-20251001",
             max_tokens=200,
             temperature=0,
             messages=[{
@@ -114,7 +123,7 @@ def summarize_tool(content: str, max_tokens: int = 1200) -> str:
     async def _run():
         def _sync_call():
             return client.messages.create(
-                model="claude-3-haiku-20240307",   # ⚡ 빠른 모델
+                model="claude-haiku-4-5-20251001",   # ⚡ 빠른 모델
                 max_tokens=max_tokens,
                 temperature=0.7,
                 messages=[
@@ -146,27 +155,162 @@ def summarize_tool(content: str, max_tokens: int = 1200) -> str:
         return f"Error: {str(e)}"
 
 # ------------------------------------------------
+def _chunk_blocks(blocks: List[Dict[str, Any]], size: int = 90):
+    # 여유를 두고 90개씩 잘라 보냅니다. (최대 100 제한 회피)
+    for i in range(0, len(blocks), size):
+        yield blocks[i:i+size]
+
+def _append_children(page_id: str, children_chunk: List[Dict[str, Any]], token: str):
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+    # Notion: Append block children → PATCH /blocks/{block_id}/children
+    url = f"{NOTION_API_BASE}/blocks/{page_id}/children"
+    resp = requests.patch(url, headers=headers, json={"children": children_chunk}, timeout=30)
+    return resp
+
+# ------------------------------------------------
 # Notion 저장
 # ------------------------------------------------
-def notion_create_page(title: str, blocks: list, extra_props: dict | None = None):
-    if not NOTION_TOKEN:
+
+def notion_create_page_with_db_id(
+    title: str,
+    blocks: list,
+    extra_props: dict | None,
+    token: str,
+    database_id: str,
+):
+    if not token:
         return {"status": "error", "message": "NOTION_TOKEN missing"}
+    if not database_id:
+        return {"status": "error", "message": "NOTION_DATABASE_ID missing"}
 
     headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Authorization": f"Bearer {token}",
         "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
     }
 
-    props = {"이름": {"title": [{"text": {"content": title}}]}}
+    props = {"Name": {"title": [{"text": {"content": title}}]}}
+    if extra_props:
+        # 한글 키 → 영문 스키마 매핑(기존 로직 유지)
+        if "과제 마감일" in extra_props and "Date" not in props:
+            props["Date"] = extra_props["과제 마감일"]
+        if "다중 선택" in extra_props and "Tags" not in props:
+            props["Tags"] = extra_props["다중 선택"]
+        for k in ("Date", "Tags", "Status", "Source"):
+            if k in extra_props:
+                props[k] = extra_props[k]
+
+    # 1) 첫 청크(<=100개 이하)만 포함하여 페이지 생성
+    first_children = list(_chunk_blocks(blocks, 90))[0] if blocks else []
+    payload = {
+        "parent": {"database_id": database_id},
+        "properties": props,
+        "children": first_children,
+    }
+
+    create_resp = requests.post(f"{NOTION_API_BASE}/pages", headers=headers, json=payload, timeout=30)
+    if not (200 <= create_resp.status_code < 300):
+        return {"status": "error", "message": create_resp.text}
+
+    data = create_resp.json()
+    page_id = data.get("id")
+    page_url = data.get("url")
+
+    # 2) 남은 블록들 나눠서 append
+    if blocks and len(blocks) > len(first_children):
+        # 이미 보낸 첫 덩어리를 제외한 나머지
+        remaining = blocks[len(first_children):]
+
+        for chunk in _chunk_blocks(remaining, 90):
+            # Rate limit 완화(권장): 3 rps 이하 → 약간의 sleep
+            resp = _append_children(page_id, chunk, token)
+            if not (200 <= resp.status_code < 300):
+                # 부분 실패 시 어디까지 들어갔는지 알려주기
+                return {
+                    "status": "partial_error",
+                    "message": resp.text,
+                    "url": page_url,
+                    "page_id": page_id,
+                }
+            time.sleep(0.35)  # 안전한 간격
+
+    return {"status": "ok", "url": page_url, "id": page_id}
+# DB에서 사용자 토큰 조회
+def get_user_token(user_email: str):
+    session = SessionLocal()
+    try:
+        row = session.execute(
+            text(
+                "SELECT notion_token FROM notion_tokens "
+                "JOIN google_users ON notion_tokens.google_user_id = google_users.id "
+                "WHERE google_users.email = :email LIMIT 1"
+            ),
+            {"email": user_email}
+        ).fetchone()
+        if row:
+            return row[0]
+    finally:
+        session.close()
+    return None
+
+# notion_tool 시그니처 확장
+@mcp.tool()
+def notion_tool(
+    content: str,
+    title: str = "학습 요약",
+    date: str | None = None,
+    tags: list[str] | None = None,
+    user_email: str | None = None,
+    notion_database_id: str | None = None,   # 이미 있으면 유지
+    user_token_plain: str | None = None,     # ✅ 추가
+) -> dict:
+    # 1) 서버에서 넘겨준 평문 토큰이 최우선
+    user_token = user_token_plain
+    # 2) 없으면 기존 로직
+    if not user_token:
+        user_token = get_user_token(user_email) if user_email else NOTION_TOKEN
+    if not user_token:
+        return {"status": "error", "message": "NOTION_TOKEN missing"}
+
+    blocks = markdown_to_blocks(content)
+    extra = {}
+    if date:
+        extra["과제 마감일"] = {"date": {"start": date}}
+    if tags:
+        extra["다중 선택"] = {"multi_select": [{"name": t} for t in tags]}
+
+    # DB ID 결정
+    db_id = notion_database_id or NOTION_DATABASE_ID
+    if not db_id:
+        return {"status": "error", "message": "NOTION_DATABASE_ID missing"}
+
+    # (헬퍼가 있다면 그걸 사용)
+    return notion_create_page_with_db_id(title, blocks, extra, token=user_token, database_id=db_id)
+
+
+# helper로 분리(가독성)
+"""
+def notion_create_page_with_db_id(title: str, blocks: list, extra_props: dict | None, token: str, database_id: str):
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+    props = {"Name": {"title": [{"text": {"content": title}}]}}
     if extra_props:
         props.update(extra_props)
 
     payload = {
-        "parent": {"database_id": NOTION_DATABASE_ID},
+        "parent": {"database_id": database_id},
         "properties": props,
         "children": blocks
     }
+
+    print(f"[Notion] token_head={token[:6]} len={len(token)} db={database_id[:8]}...", flush=True)
 
     resp = requests.post(f"{NOTION_API_BASE}/pages", headers=headers, json=payload, timeout=30)
     if 200 <= resp.status_code < 300:
@@ -174,16 +318,7 @@ def notion_create_page(title: str, blocks: list, extra_props: dict | None = None
         return {"status": "ok", "url": data.get("url"), "id": data.get("id")}
     else:
         return {"status": "error", "message": resp.text}
-
-@mcp.tool()
-def notion_tool(content: str, title: str = "학습 요약", date: str | None = None, tags: list[str] | None = None) -> dict:
-    blocks = markdown_to_blocks(content)
-    extra = {}
-    if date:
-        extra["과제 마감일"] = {"date": {"start": date}}
-    if tags:
-        extra["다중 선택"] = {"multi_select": [{"name": t} for t in tags]}
-    return notion_create_page(title, blocks, extra)
+"""
 
 @mcp.tool()
 def compose_dual_tool(text: str) -> dict:
@@ -251,7 +386,7 @@ def compose_dual_tool(text: str) -> dict:
             f"{t}"
         )
         resp = client.messages.create(
-            model="claude-3-haiku-20240307",
+            model="claude-haiku-4-5-20251001",
             max_tokens=1600,
             temperature=0.4,
             messages=[{"role": "user", "content": prompt}],

@@ -35,6 +35,16 @@ async function postFormData<T>(path: string, fd: FormData): Promise<T> {
   return r.json();
 }
 
+async function getJSON<T>(path: string): Promise<T> {
+  const r = await fetch(`${API_BASE}${path}`, { credentials: "include" });
+  if (!r.ok) {
+    // 401이면 로그인 필요
+    if (r.status === 401) throw new Error("unauthenticated");
+    throw new Error(await r.text());
+  }
+  return r.json();
+}
+
 // 타입
 interface ProcessOut {
   title: string;
@@ -109,6 +119,7 @@ const IconX = () => (
 );
 
 export default function App() {
+
   const [text, setText] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [makePpt, setMakePpt] = useState(false);
@@ -126,6 +137,21 @@ export default function App() {
   const [me, setMe] = useState<MeResp | null>(null);
   useEffect(() => { fetchMe().then(setMe).catch(() => setMe(null)); }, []);
 
+    // 모달 단계: 확인 → 토큰입력
+  type ConfirmPhase = "confirm" | "setup";
+  const [phase, setPhase] = useState<ConfirmPhase>("confirm");
+  const [tokenInput, setTokenInput] = useState("");
+  const [parentUrl, setParentUrl] = useState("");   // ★ 추가
+  const [submitting, setSubmitting] = useState(false);
+
+  // 모달 열릴 때마다 초기화
+  useEffect(() => {
+    if (confirmOpen) {
+      setPhase("confirm");
+      setTokenInput("");
+    }
+  }, [confirmOpen]);
+
   function goGoogleLogin() {
     window.location.href = `${BACKEND}/auth/google/login`;
   }
@@ -142,30 +168,100 @@ export default function App() {
     if (f) { setFile(f); toast.show("파일을 추가했어요"); }
   }
 
-  async function doSubmit() {
-    setLoading(true); setError(null); setRes(null);
+  async function ensureNotionReady(): Promise<boolean> {
     try {
-      if (file) {
-        const fd = new FormData();
-        fd.append("file", file);
-        fd.append("make_ppt", String(makePpt));
-        if (tags.trim()) fd.append("tags", tags);
-        if (date.trim()) fd.append("date", date);
-        const data = await postFormData<ProcessOut>("/process-file", fd);
-        setRes(data);
-      } else {
-        const payload = { text, make_ppt: makePpt, tags: tags.split(",").map(s=>s.trim()).filter(Boolean), date: date || null };
-        const data = await postJSON<ProcessOut>("/process", payload);
-        setRes(data);
+      const tokenStatus = await getJSON<{ ok: boolean; has_token: boolean }>("/me/notion-token");
+      const dbStatus    = await getJSON<{ ok: boolean; has_database: boolean; parent_page_id?: string | null }>("/me/notion-db");
+
+      if (!tokenStatus.has_token || !dbStatus.has_database) {
+        setPhase("setup");       // 모달 내 단계 전환
+        setConfirmOpen(true);    // 혹시 닫혀있어도 다시 띄우기
+        return false;
       }
-      toast.show("정리 완료!");
+      return true;
+
     } catch (e: any) {
-      setError(e?.message || "요청 실패");
-    } finally {
-      setLoading(false);
-      setConfirmOpen(false);
+      if (e?.message === "unauthenticated") {
+        toast.show("로그인이 필요합니다.");
+        goGoogleLogin();
+        return false;
+      }
+      setError(e?.message || "노션 준비 중 오류");
+      setPhase("setup");
+      setConfirmOpen(true);
+      return false;
     }
   }
+
+
+  async function saveSetupAndProceed() {
+    if (!tokenInput.trim() || !parentUrl.trim()) {        // ✅ AND 조건
+      setError("Notion 토큰과 부모 페이지 URL을 모두 입력하세요.");
+      return;
+    }
+    try {
+      setSubmitting(true);
+      await postJSON("/me/notion-setup", {
+        token: tokenInput.trim(),
+        parent_url: parentUrl.trim(),
+        name: "MindFlow Notes",
+      });
+      toast.show("노션 연동 준비 완료!");
+      setPhase("confirm");
+      await doSubmit();  // 성공 시 doSubmit이 모달 닫음
+    } catch (e: any) {
+      setError(e?.message || "노션 설정 저장 실패");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+
+
+async function doSubmit() {
+  setLoading(true);
+  setError(null);
+  setRes(null);
+
+  try {
+    const ok = await ensureNotionReady();
+    if (!ok) {
+      // 셋업 필요 → 모달 유지 (닫지 않음)
+      return;
+    }
+
+    // 파일 or 텍스트 처리
+    if (file) {
+      const fd = new FormData();
+      fd.append("file", file);
+      fd.append("make_ppt", String(makePpt));
+      if (tags.trim()) fd.append("tags", tags);
+      if (date.trim()) fd.append("date", date);
+      const data = await postFormData<ProcessOut>("/process-file", fd);
+      setRes(data);
+    } else {
+      const payload = {
+        text,
+        make_ppt: makePpt,
+        tags: tags.split(",").map((s) => s.trim()).filter(Boolean),
+        date: date || null,
+      };
+      const data = await postJSON<ProcessOut>("/process", payload);
+      setRes(data);
+    }
+
+    toast.show("정리 완료!");
+    // ✅ 실제 처리 성공했을 때만 닫기
+    setConfirmOpen(false);
+
+  } catch (e: any) {
+    setError(e?.message || "요청 실패");
+  } finally {
+    setLoading(false);
+    // ❌ 여기서는 모달을 닫지 않는다 (phase가 setup으로 바뀌기 전에 닫혀버리는 레이스 방지)
+  }
+}
+
 
   return (
     <div className="min-h-screen flex flex-col bg-gradient-to-b from-white via-white to-gray-100">
@@ -365,20 +461,81 @@ export default function App() {
 
       {/* 확인 모달 */}
       {confirmOpen && (
-        <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" onClick={()=>setConfirmOpen(false)}>
-          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6" onClick={(e)=>e.stopPropagation()}>
-            <div className="text-lg font-semibold mb-1">이대로 진행할까요?</div>
-            <p className="text-sm text-gray-600 mb-5">Notion 저장은 항상 수행됩니다. {makePpt ? "PPT도 함께 생성합니다." : "PPT는 생성하지 않습니다."}</p>
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/40 p-4" onClick={() => setConfirmOpen(false)}>
+      <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6" onClick={(e) => e.stopPropagation()}>
+        <div className="text-lg font-semibold mb-1">이대로 진행할까요?</div>
+        <p className="text-sm text-gray-600 mb-5">
+          Notion 저장은 항상 수행됩니다. {makePpt ? "PPT도 함께 생성합니다." : "PPT는 생성하지 않습니다."}
+        </p>
+
+        {/* confirm 단계: 기존과 동일한 PPT 스위치 UI */}
+        {phase === "confirm" && (
+          <>
             <div className="flex items-center justify-between mb-4">
               <Switch checked={makePpt} onChange={setMakePpt} label="PPT 생성" />
             </div>
             <div className="flex justify-end gap-2">
-              <button className="px-4 py-2 rounded-xl border" onClick={()=>setConfirmOpen(false)}>취소</button>
-              <button className="px-4 py-2 rounded-xl bg-black text-white" onClick={doSubmit}>확인</button>
+              <button className="px-4 py-2 rounded-xl border" onClick={() => setConfirmOpen(false)}>취소</button>
+              <button
+                className="px-4 py-2 rounded-xl bg-black text-white"
+                onClick={doSubmit}
+                disabled={loading}
+              >
+                확인
+              </button>
             </div>
-          </div>
-        </div>
-      )}
+          </>
+        )}
+
+        {/* token 단계: 같은 모달에서 토큰 입력 → 저장하고 진행 */}
+        {phase === "setup" && (
+          <>
+            <div className="text-lg font-semibold mb-3">노션 연동 설정</div>
+            <div className="space-y-3 mb-4">
+              <div>
+                <label className="text-sm text-gray-700">Notion API 토큰 (secret_…)</label>
+                <input
+                  type="password"
+                  placeholder="secret_..."
+                  value={tokenInput}
+                  onChange={(e) => setTokenInput(e.target.value)}
+                  className="mt-1 w-full border rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-black/50"
+                />
+              </div>
+              <div>
+                <label className="text-sm text-gray-700">저장할 부모 페이지 URL</label>
+                <input
+                  type="text"
+                  placeholder="예) https://www.notion.so/..."
+                  value={parentUrl}
+                  onChange={(e) => setParentUrl(e.target.value)}
+                  className="mt-1 w-full border rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-black/50"
+                />
+                <p className="mt-2 text-xs text-gray-500">
+                  노션에서 상위 페이지를 만들고 우측 상단 ‘공유 → 통합에 연결’로 권한을 부여한 뒤 URL을 붙여넣으세요.
+                </p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button className="px-4 py-2 rounded-xl border" onClick={() => setPhase("confirm")} disabled={submitting}>
+                뒤로
+              </button>
+              <button
+                className="px-4 py-2 rounded-xl bg-black text-white"
+                onClick={saveSetupAndProceed}
+                disabled={submitting || !(tokenInput.trim() && parentUrl.trim())}  // ✅ 둘 다 필수
+              >
+                저장하고 진행
+              </button>
+            </div>
+            {error && <div className="mt-3 p-3 rounded-xl bg-red-50 text-red-700 text-sm">{error}</div>}
+          </>
+        )}
+
+      </div>
+    </div>
+  )}
+
 
       {/* 토스트 */}
       {toast.msg && (
